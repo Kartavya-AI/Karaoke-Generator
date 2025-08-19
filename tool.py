@@ -1,36 +1,41 @@
 import os
 import tempfile
 import json
-from typing import Dict, List, Any, Callable
+import re
+from typing import Dict, List, Any, Callable, Tuple
 from langchain_community.chat_models import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langchain.schema import HumanMessage, SystemMessage
 import yt_dlp
 import librosa
 import soundfile as sf
-import cv2
 import numpy as np
-# Correctly import VideoClip alongside the others
-from moviepy.editor import VideoClip, VideoFileClip, TextClip, CompositeVideoClip, AudioFileClip
+from scipy.signal import butter, sosfilt
 import lyricsgenius
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 class KaraokeGenerator:
-    def __init__(self, openai_api_key: str):
-        self.openai_api_key = openai_api_key
+    def __init__(self):
+        self.openai_api_key = os.getenv("OPENAI_API_KEY")
+        self.genius_access_token = os.getenv("GENIUS_ACCESS_TOKEN")
+        if not self.openai_api_key or not self.genius_access_token:
+            raise ValueError("OPENAI_API_KEY and GENIUS_ACCESS_TOKEN must be set in your environment.")
+        
         self.llm = ChatOpenAI(
-            openai_api_key=openai_api_key,
-            model="gpt-4",
+            openai_api_key=self.openai_api_key,
+            model="gpt-4o-mini",
             temperature=0.3
         )
-        # You'll need to get a Genius API key for lyrics
-        # self.genius = lyricsgenius.Genius("YOUR_GENIUS_API_KEY")
-    
+        self.genius = lyricsgenius.Genius(self.genius_access_token, verbose=False, remove_section_headers=True)
+
     def get_clarifying_questions(self, song_name: str) -> List[str]:
-        """Generate 2-3 clarifying questions about the song."""
         prompt = ChatPromptTemplate.from_messages([
             SystemMessage(content="""You are a music expert helping to identify the exact song for karaoke generation.
             Given a song name, generate 2-3 specific questions to clarify which exact version/recording the user wants.
-            Focus on: artist/performer, specific version, language, or notable covers.
+            Focus on: artist/performer, specific version, or language.
             Keep questions simple and practical."""),
             HumanMessage(content=f"Song name: {song_name}")
         ])
@@ -45,165 +50,205 @@ class KaraokeGenerator:
         return questions[:3]
 
     def get_song_info(self, song_name: str, answers: Dict[str, str]) -> Dict[str, Any]:
-        """Get detailed song information using LLM."""
         answers_text = "\n".join([f"- {answer}" for answer in answers.values() if answer])
         prompt = ChatPromptTemplate.from_messages([
             SystemMessage(content="""You are a music database expert. Based on the song name and additional details,
-            provide a JSON object with: title, artist, album, year, genre, duration (mm:ss), language, and a popularity score (1-10).
-            Return ONLY the JSON object."""),
+            provide a JSON object with EXACTLY these fields:
+            - title: string (song title)
+            - artist: string (artist name)
+            - album: string (album name, or "Single" if unknown)
+            - year: string (year or "Unknown")
+            - genre: string (music genre)
+            - duration: string (format: "mm:ss", estimate if unknown)
+            - language: string (primary language of the song)
+            - popularity: number (integer from 1-10)
+            
+            Return ONLY the JSON object, no additional text. Ensure all fields are included."""),
             HumanMessage(content=f"Song: {song_name}\nAdditional details:\n{answers_text}")
         ])
         response = self.llm.invoke(prompt.format_messages())
         
+        default_info = {
+            "title": song_name, "artist": "Unknown Artist", "album": "Unknown Album", 
+            "year": "Unknown", "genre": "Pop", "duration": "3:30", 
+            "language": "English", "popularity": 5
+        }
+        
         try:
-            return json.loads(response.content)
-        except:
-            return {
-                "title": song_name, "artist": "Unknown", "album": "Unknown", "year": "Unknown",
-                "genre": "Unknown", "duration": "3:30", "language": "English", "popularity": 5
-            }
+            content = response.content.strip()
+            if content.startswith('```'):
+                content = content.split('```')[1]
+                if content.startswith('json'): content = content[4:]
+            content = content.strip()
+            parsed_info = json.loads(content)
+            
+            for key, default_value in default_info.items():
+                if key not in parsed_info: parsed_info[key] = default_value
+                if key == 'popularity':
+                    try: parsed_info[key] = min(10, max(1, int(parsed_info[key])))
+                    except: parsed_info[key] = 5
+            return parsed_info
+        except Exception:
+            default_info["title"] = song_name
+            return default_info
 
     def get_lyrics(self, song_info: Dict[str, Any]) -> str:
-        """Get song lyrics using multiple methods."""
         try:
-            if hasattr(self, 'genius'):
-                song = self.genius.search_song(song_info['title'], song_info['artist'])
-                if song:
-                    return song.lyrics
-        except:
-            pass
-        
-        prompt = ChatPromptTemplate.from_messages([
-            SystemMessage(content="You are a lyrics database. Provide the complete lyrics for the requested song with proper verse/chorus structure."),
-            HumanMessage(content=f"Song: {song_info['title']} by {song_info['artist']}")
-        ])
-        response = self.llm.invoke(prompt.format_messages())
-        return response.content
+            song = self.genius.search_song(song_info['title'], song_info['artist'])
+            if song:
+                lyrics = re.sub(r'\[.*?\]', '', song.lyrics).strip()
+                lines = lyrics.split('\n')
+                if len(lines) > 1 and lines[0].strip().lower() == song_info['title'].lower():
+                    lyrics = '\n'.join(lines[1:]).strip()
+                return lyrics
+            else:
+                return "Lyrics not found for this song."
+        except Exception as e:
+            print(f"Error fetching lyrics from Genius: {e}")
+            return "Could not fetch lyrics."
 
     def download_audio(self, song_info: Dict[str, Any]) -> str:
-        """Download audio using yt-dlp."""
-        search_query = f"{song_info['title']} {song_info['artist']} official audio"
+        search_query = f"{song_info.get('title', '')} {song_info.get('artist', '')} official audio"
+        temp_path = tempfile.mktemp(suffix='.%(ext)s')
+        
         ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': tempfile.mktemp(suffix='.%(ext)s'),
-            'noplaylist': True,
+            'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best',
+            'outtmpl': temp_path, 'noplaylist': True, 'extract_flat': False,
+            'prefer_ffmpeg': True,
+            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'wav', 'preferredquality': '192'}],
         }
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 search_results = ydl.extract_info(f"ytsearch1:{search_query}", download=False)
-                if search_results['entries']:
-                    video_url = search_results['entries'][0]['webpage_url']
-                    info = ydl.extract_info(video_url, download=True)
-                    return ydl.prepare_filename(info)
-                else:
-                    raise Exception("No search results found for the song on YouTube.")
+                if not search_results.get('entries'):
+                    raise Exception("No search results found on YouTube.")
+                
+                video_url = search_results['entries'][0]['webpage_url']
+                ydl.extract_info(video_url, download=True)
+                wav_path = temp_path.replace('.%(ext)s', '.wav')
+                
+                if os.path.exists(wav_path): return wav_path
+                else: raise Exception("Downloaded audio file not found.")
         except Exception as e:
             raise Exception(f"Failed to download audio: {str(e)}")
 
-    def separate_vocals(self, audio_path: str) -> str:
-        """
-        Separate vocals from music using librosa's Harmonic-Percussive Source Separation.
-        """
-        output_dir = tempfile.mkdtemp()
-        instrumental_path = os.path.join(output_dir, 'instrumental.wav')
+    def separate_vocals_advanced(self, audio_path: str) -> str:
+        if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 10240:
+            raise ValueError("Downloaded audio file is missing or empty.")
         
         try:
-            if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 10240: # 10 KB threshold
-                raise ValueError("Downloaded audio file is missing, empty, or too small.")
+            y, sr = librosa.load(audio_path, sr=44100, mono=False)
+            if y.ndim > 1 and y.shape[0] == 2:
+                y_instrumental = y[0] - y[1]
 
-            y, sr = librosa.load(audio_path, sr=22050, mono=True)
-            y_harmonic, _ = librosa.effects.hpss(y)
+            else:
+                y_mono = librosa.to_mono(y)
+                y_harmonic, y_percussive = librosa.effects.hpss(y_mono, margin=3.0)
+                S_harmonic = librosa.stft(y_harmonic)
+                S_vocals_approx = np.median(np.abs(S_harmonic), axis=1, keepdims=True) * np.ones_like(S_harmonic)
+                mask = np.minimum(1.0, 2.0 * np.abs(S_vocals_approx) / (np.abs(S_harmonic) + 1e-8))
+                S_harmonic_instrumental = S_harmonic * (1 - mask)
+                y_harmonic_instrumental = librosa.istft(S_harmonic_instrumental)
+                y_instrumental = y_percussive + y_harmonic_instrumental
+
+            max_val = np.max(np.abs(y_instrumental))
+            if max_val > 0:
+                y_instrumental = y_instrumental / max_val * 0.95
+            output_path = tempfile.mktemp(suffix='.wav')
+            sf.write(output_path, y_instrumental, sr, format='WAV', subtype='PCM_16')
+            return output_path
             
-            sf.write(instrumental_path, y_harmonic, sr)
-            
-            return instrumental_path
         except Exception as e:
-            print(f"A detailed error occurred in librosa: {e}")
-            raise Exception(f"Could not process the audio file with librosa. Ensure FFmpeg is installed and accessible in your system's PATH.")
+            raise Exception(f"Could not process the audio file: {str(e)}")
 
-    def create_karaoke_video(self, instrumental_path: str, lyrics: str, song_info: Dict[str, Any]) -> str:
-        """Create karaoke video with lyrics and instrumental."""
-        audio_clip = AudioFileClip(instrumental_path)
-        duration = audio_clip.duration
-        background = self.create_background_video(duration)
-        timed_lyrics = self.time_lyrics(lyrics, duration)
+    def create_synchronized_lyrics(self, lyrics: str, duration_str: str) -> List[Tuple[float, float, str]]:
+        try:
+            minutes, seconds = map(int, duration_str.split(':'))
+            total_duration = minutes * 60 + seconds
+        except:
+            total_duration = 210
         
-        text_clips = []
-        for start_time, end_time, text in timed_lyrics:
-            text_clip = TextClip(
-                text, fontsize=50, color='white', font='Arial-Bold',
-                stroke_color='black', stroke_width=2
-            ).set_position('center').set_start(start_time).set_end(end_time)
-            text_clips.append(text_clip)
-        
-        final_video = CompositeVideoClip([background] + text_clips).set_audio(audio_clip)
-        
-        output_path = tempfile.mktemp(suffix='.mp4')
-        final_video.write_videofile(
-            output_path, codec='libx264', audio_codec='aac',
-            temp_audiofile=tempfile.mktemp(suffix='.m4a'), remove_temp=True,
-            verbose=False, logger=None
-        )
-        return output_path
-
-    def create_background_video(self, duration: float) -> VideoClip:
-        """Create a simple, animated gradient background video."""
-        width, height = 1920, 1080
-        def make_frame(t):
-            gradient = np.zeros((height, width, 3), dtype=np.uint8)
-            hue = (t * 20) % 360
-            color1_hsv = np.array([hue, 255, 100])
-            color2_hsv = np.array([(hue + 60) % 360, 255, 150])
-            for y in range(height):
-                ratio = y / height
-                color_hsv = color1_hsv * (1 - ratio) + color2_hsv * ratio
-                gradient[y, :] = cv2.cvtColor(np.uint8([[color_hsv]]), cv2.COLOR_HSV2RGB)[0, 0]
-            return gradient
-        
-        # Use VideoClip for generated content, not VideoFileClip
-        return VideoClip(make_frame, duration=duration)
-
-    def time_lyrics(self, lyrics: str, duration: float) -> List[tuple]:
-        """Evenly time lyrics to fit the song duration."""
-        lines = [line.strip() for line in lyrics.split('\n') if line.strip() and not line.startswith('[')]
+        lines = [line for line in lyrics.split('\n') if line.strip() and len(line.strip()) > 2]
         if not lines:
-            return [(0, duration, "♪ Instrumental ♪")]
-        
-        time_per_line = duration / len(lines)
-        timed_lyrics = []
-        for i, line in enumerate(lines):
-            start_time = i * time_per_line
-            end_time = (i + 1) * time_per_line
-            timed_lyrics.append((start_time, end_time, line))
-        
-        return timed_lyrics
+            return [(0, total_duration, "🎵 Instrumental Track 🎵")]
 
-    def generate_karaoke(self, song_name: str, answers: Dict[str, str], 
-                        progress_callback: Callable = None) -> Dict[str, Any]:
-        """Main method to generate complete karaoke."""
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessage(content=f"""You are a karaoke timing expert. Your task is to analyze the provided song lyrics and create a synchronized timeline.
+            The total song duration is {total_duration} seconds.
+            Analyze the structure (verses, chorus, pauses) to estimate the start and end time for each line.
+            - Add an 8-second instrumental intro.
+            - Leave a 5-second instrumental outro.
+            - A chorus line is typically faster than a verse line.
+            - Add small pauses (0.5s) between lines.
+            
+            Return a JSON array of objects, where each object has "start" (float), "end" (float), and "text" (string) for each line.
+            The final "end" time should not exceed {total_duration}.
+            
+            Example format:
+            [
+              {{"start": 0.0, "end": 8.0, "text": "🎵 Intro 🎵"}},
+              {{"start": 8.5, "end": 12.0, "text": "First line of lyrics"}},
+              ...
+            ]
+            Return ONLY the JSON array."""),
+            HumanMessage(content=f"Lyrics:\n{lyrics}")
+        ])
+        
+        try:
+            response = self.llm.invoke(prompt.format_messages())
+            content = response.content.strip()
+            json_start_index = content.find('[')
+            json_end_index = content.rfind(']')
+            
+            if json_start_index != -1 and json_end_index != -1:
+                json_string = content[json_start_index : json_end_index + 1]
+                timed_data = json.loads(json_string)
+                timed_lyrics = [(item['start'], item['end'], item['text']) for item in timed_data]
+                return timed_lyrics
+            else:
+                raise ValueError("LLM response did not contain a valid JSON array.")
+
+        except Exception as e:
+            print(f"Error creating synchronized lyrics with LLM: {e}. Falling back to basic timing.")
+            timed_lyrics = [(0, 8.0, "🎵 Get ready to sing! 🎵")]
+            time_per_line = (total_duration - 16) / len(lines) if lines else 5.0
+            current_time = 8.0
+            for line in lines:
+                end_time = current_time + time_per_line
+                timed_lyrics.append((current_time, end_time, line))
+                current_time = end_time + 0.5
+            timed_lyrics.append((current_time, total_duration, "🎵 Thank you for singing! 🎵"))
+            return timed_lyrics
+
+    def generate_karaoke(self, song_name: str, answers: Dict[str, str], progress_callback: Callable = None) -> Dict[str, Any]:
         try:
             if progress_callback: progress_callback("Getting song information...", 0.1)
             song_info = self.get_song_info(song_name, answers)
             
-            if progress_callback: progress_callback("Fetching lyrics...", 0.2)
+            if progress_callback: progress_callback("Fetching accurate lyrics...", 0.2)
             lyrics = self.get_lyrics(song_info)
+            if "not found" in lyrics.lower() or "could not fetch" in lyrics.lower():
+                raise Exception("Could not retrieve lyrics for this song.")
             
-            if progress_callback: progress_callback("Downloading audio...", 0.4)
+            if progress_callback: progress_callback("Downloading high-quality audio...", 0.4)
             audio_path = self.download_audio(song_info)
             
-            if progress_callback: progress_callback("Creating instrumental track...", 0.6)
-            instrumental_path = self.separate_vocals(audio_path)
+            if progress_callback: progress_callback("Creating instrumental track...", 0.7)
+            instrumental_path = self.separate_vocals_advanced(audio_path)
             
-            if progress_callback: progress_callback("Generating karaoke video...", 0.8)
-            video_path = self.create_karaoke_video(instrumental_path, lyrics, song_info)
+            if progress_callback: progress_callback("Synchronizing lyrics...", 0.9)
+            timed_lyrics = self.create_synchronized_lyrics(lyrics, song_info.get('duration', '3:30'))
             
             if progress_callback: progress_callback("Complete!", 1.0)
             
+            if os.path.exists(audio_path): os.remove(audio_path)
+            
             return {
-                'song_info': song_info, 'lyrics': lyrics,
-                'instrumental_path': instrumental_path, 'video_path': video_path,
-                'success': True
+                'song_info': song_info, 'lyrics': lyrics, 'timed_lyrics': timed_lyrics,
+                'instrumental_path': instrumental_path, 'success': True
             }
         except Exception as e:
-            return {'success': False, 'error': str(e)}
+            error_msg = f"Error generating karaoke: {str(e)}"
+            print(error_msg)
+            return {'success': False, 'error': error_msg}
