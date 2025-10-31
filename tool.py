@@ -29,7 +29,19 @@ class KaraokeGenerator:
             model="gpt-4o-mini",
             temperature=0.3
         )
-        self.genius = lyricsgenius.Genius(self.genius_access_token, verbose=False, remove_section_headers=True)
+        self.genius = lyricsgenius.Genius(
+            self.genius_access_token,
+            verbose=False,
+            remove_section_headers=True,
+            sleep_time=0.5,
+            timeout=10,
+            retries=1
+        )
+        self.genius._session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                          " AppleWebKit/537.36 (KHTML, like Gecko)"
+                          " Chrome/121.0.0.0 Safari/537.36"
+        })
 
     def get_clarifying_questions(self, song_name: str) -> List[str]:
         prompt = ChatPromptTemplate.from_messages([
