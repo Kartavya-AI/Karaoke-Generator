@@ -2,6 +2,7 @@ import os
 import tempfile
 import json
 import re
+import requests
 from typing import Dict, List, Any, Callable, Tuple
 from langchain_community.chat_models import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -29,19 +30,15 @@ class KaraokeGenerator:
             model="gpt-4o-mini",
             temperature=0.3
         )
-        self.genius = lyricsgenius.Genius(
-            self.genius_access_token,
-            verbose=False,
-            remove_section_headers=True,
-            sleep_time=0.5,
-            timeout=10,
-            retries=1
-        )
-        self.genius._session.headers.update({
+        self.genius_api_base = "https://api.genius.com"
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {self.genius_access_token}",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
                           " AppleWebKit/537.36 (KHTML, like Gecko)"
                           " Chrome/121.0.0.0 Safari/537.36"
         })
+        
 
     def get_clarifying_questions(self, song_name: str) -> List[str]:
         prompt = ChatPromptTemplate.from_messages([
@@ -105,7 +102,7 @@ class KaraokeGenerator:
             return default_info
 
     def get_lyrics(self, song_info: Dict[str, Any]) -> str:
-        try:
+        '''try:
             song = self.genius.search_song(song_info['title'], song_info['artist'])
             if song and song.lyrics:
                 lyrics = re.sub(r'\[.*?\]', '', song.lyrics).strip()
@@ -133,7 +130,57 @@ class KaraokeGenerator:
         except Exception as e:
             print(f"Error fetching from lyrics.ovh: {e}")
     
+        return "Lyrics not found for this song."'''
+        title = song_info.get("title", "")
+        artist = song_info.get("artist", "")
+
+        # ---- Try Genius API (not scraping)
+        try:
+            search_url = f"{self.genius_api_base}/search"
+            params = {"q": f"{title} {artist}"}
+            res = self.session.get(search_url, params=params, timeout=10)
+
+            if res.status_code == 200:
+                data = res.json()
+                hits = data.get("response", {}).get("hits", [])
+                if hits:
+                    song_api_path = hits[0]["result"]["api_path"]
+                    song_url = f"{self.genius_api_base}{song_api_path}"
+                    song_res = self.session.get(song_url, timeout=10)
+                    if song_res.status_code == 200:
+                        song_data = song_res.json()
+                        lyrics_path = song_data["response"]["song"]["path"]
+                        # Fetch HTML lyrics page (Genius blocks API lyrics text)
+                        html_res = requests.get("https://genius.com" + lyrics_path, headers=self.session.headers)
+                        if html_res.status_code == 200:
+                            html = html_res.text
+                            # Clean HTML tags to get lyrics
+                            lyrics = re.sub(r"<.*?>", "", html)
+                            lyrics = re.sub(r"\[.*?\]", "", lyrics)
+                            lyrics = lyrics.strip()
+                            if len(lyrics.split()) > 10:
+                                return lyrics
+            print(f"Genius API failed with status {res.status_code}")
+        except Exception as e:
+            print(f"Error fetching lyrics from Genius: {e}")
+
+        # ---- Fallback: Lyrics.ovh
+        print("Falling back to lyrics.ovh API...")
+        try:
+            url = f"https://api.lyrics.ovh/v1/{artist}/{title}"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                lyrics = data.get("lyrics", "").strip()
+                if lyrics:
+                    lyrics = re.sub(r"\[.*?\]", "", lyrics)
+                    return lyrics
+            print(f"Lyrics.ovh fallback failed: {resp.status_code}")
+        except Exception as e:
+            print(f"Error fetching from lyrics.ovh: {e}")
+
         return "Lyrics not found for this song."
+        
             
 
     def download_audio(self, song_info: Dict[str, Any]) -> str:
