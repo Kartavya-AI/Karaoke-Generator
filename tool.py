@@ -95,7 +95,7 @@ class KaraokeGenerator:
     def get_lyrics(self, song_info: Dict[str, Any]) -> str:
         try:
             song = self.genius.search_song(song_info['title'], song_info['artist'])
-            if song:
+            if song and song.lyrics:
                 lyrics = re.sub(r'\[.*?\]', '', song.lyrics).strip()
                 lines = lyrics.split('\n')
                 if len(lines) > 1 and lines[0].strip().lower() == song_info['title'].lower():
@@ -105,7 +105,24 @@ class KaraokeGenerator:
                 return "Lyrics not found for this song."
         except Exception as e:
             print(f"Error fetching lyrics from Genius: {e}")
-            return "Could not fetch lyrics."
+            print("Falling back to lyrics.ovh API...")
+        try:
+            artist = song_info.get('artist', '').replace(' ', '%20')
+            title = song_info.get('title', '').replace(' ', '%20')
+            url = f"https://api.lyrics.ovh/v1/{artist}/{title}"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                lyrics = data.get('lyrics', '').strip()
+                if lyrics:
+                    lyrics = re.sub(r'\[.*?\]', '', lyrics)
+                    return lyrics
+            print(f"Lyrics.ovh fallback failed: {resp.status_code}")
+        except Exception as e:
+            print(f"Error fetching from lyrics.ovh: {e}")
+    
+        return "Lyrics not found for this song."
+            
 
     def download_audio(self, song_info: Dict[str, Any]) -> str:
         search_query = f"{song_info.get('title', '')} {song_info.get('artist', '')} official audio"
