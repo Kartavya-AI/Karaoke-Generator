@@ -5,7 +5,7 @@ import re
 from typing import Dict, List, Any, Callable, Tuple
 from langchain_community.chat_models import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.schema import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 import yt_dlp
 import librosa
 import soundfile as sf
