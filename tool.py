@@ -4,7 +4,7 @@ import json
 import re
 from typing import Dict, List, Any, Callable, Tuple
 from langchain_community.chat_models import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain.schema import HumanMessage, SystemMessage
 import yt_dlp
 import librosa
