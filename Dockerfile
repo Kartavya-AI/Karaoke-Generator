@@ -22,5 +22,5 @@ USER user
 ENV PORT=8080
 EXPOSE $PORT
 
-CMD ["python", "-m", "uvicorn", "api:app", "--host", "0.0.0.0", "--port", "$PORT"]
+CMD ["python", "-m", "uvicorn", "api:app", "--host", "0.0.0.0", "--port", $PORT]
 
