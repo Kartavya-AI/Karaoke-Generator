@@ -15,6 +15,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 COPY . .
 
+RUN ls -l /app | grep cookies
+
 RUN adduser --disabled-password --gecos '' --shell /bin/bash user \
     && chown -R user:user /app
 USER user
