@@ -22,4 +22,5 @@ USER user
 ENV PORT=8080
 EXPOSE $PORT
 
-CMD exec gunicorn --chdir /app --bind :$PORT --workers 2 --worker-class uvicorn.workers.UvicornWorker --timeout 240 api:app
+CMD ["python", "-m", "uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8080"]
+
